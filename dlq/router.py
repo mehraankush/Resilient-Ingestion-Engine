@@ -30,21 +30,11 @@ async def list_dlq_records(
     )
 
 
-@dlq_router.post(
-    "/{quarantine_id}/replay",
-    response_model=DLQReplayResponse,
-    status_code=status.HTTP_200_OK,
-    summary="Replay a quarantined payload"
-)
+@dlq_router.post("/{quarantine_id}/replay", response_model=DLQReplayResponse)
 async def replay_dlq_record(
     quarantine_id: str,
     body: ReplayDLQRequest = ReplayDLQRequest(),
 ):
-    """
-    Attempts to re-validate and process a quarantined record.
-    If successful, removes the record from the DLQ.
-    """
-    # 1. Fetch record from Redis
     record = await dlq_service.get_by_id(quarantine_id)
     if not record:
         raise HTTPException(
@@ -52,48 +42,52 @@ async def replay_dlq_record(
             detail=f"Quarantine record '{quarantine_id}' not found.",
         )
 
-    # 2. Determine target payload data
+    # 1. Parse JSON body
     target_data = body.repaired_payload
     if target_data is None:
         try:
             target_data = json.loads(record.raw_body)
         except json.JSONDecodeError as err:
+            err_msg = f"Original payload is malformed JSON: {str(err)}"
+            await dlq_service.record_failed_replay(record, err_msg)
             raise HTTPException(
                 status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Original payload is malformed JSON ({str(err)}). Provide 'repaired_payload' in request body.",
+                detail=err_msg
             )
 
-    # 3. Validate against Pydantic schema
+    # 2. Schema Validation
     try:
         validated_payload = TicketIngestPayload.model_validate(target_data)
     except ValidationError as err:
+        validation_errors = err.errors(include_context=False)
+        await dlq_service.record_failed_replay(
+            record,
+            f"Validation error: {validation_errors}",
+        )
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail={"message": "Payload still fails validation", "errors": err.errors()},
-        )
+            detail={
+                "message": "Payload still fails validation",
+                "errors": validation_errors,
+            },
+        ) from err
 
-    # 4. Re-execute through domain use case
     use_case = ProcessTicketIngestion()
     try:
-        # Replays use the original event_id/tenant_id to guarantee idempotency
         result = await use_case.execute(validated_payload)
-    except IngestionInProgressError as err:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=f"Replay lock conflict: {str(err)}",
-        )
-    except DownstreamProcessingError as err:
+    except (IngestionInProgressError, DownstreamProcessingError) as err:
+        await dlq_service.record_failed_replay(record, f"Execution failed: {str(err)}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Downstream failure during replay: {str(err)}",
+            detail=str(err)
         )
 
-    # 5. Remove from unresolved DLQ once successfully processed
-    await dlq_service.mark_resolved(quarantine_id)
+    # 4. Success -> Record the retry and mark resolved
+    updated_record = await dlq_service.record_successful_replay(record)
 
     return DLQReplayResponse(
         status="resolved",
         quarantine_id=quarantine_id,
-        message="Payload successfully validated, processed, and marked resolved.",
+        message=f"Payload replayed successfully on attempt {updated_record.retry_count}.",
         downstream_result=result.response,
     )
