@@ -5,21 +5,8 @@ provides idempotency, duplicate-request protection, response caching, and a
 dead-letter queue (DLQ) for invalid payloads.
 
 ## How it works
+<img width="500" height="467" alt="image" src="https://github.com/user-attachments/assets/71edae61-4c87-4da9-911f-12655035f7b7" />
 
-```mermaid
-flowchart LR
-    Request[Ingest request] --> Validate{Valid payload?}
-    Validate -->|No| DLQ[Quarantine in DLQ]
-    DLQ --> Accepted[202 Accepted]
-    Validate -->|Yes| Lock{Acquire Redis lock}
-    Lock -->|New| Process[Process event]
-    Process --> Cache[Cache completed result]
-    Cache --> Created[201 Created]
-    Lock -->|Completed| Hit[200 Cache HIT]
-    Lock -->|In progress| Conflict[409 Conflict]
-    DLQ --> Replay[Repair and replay]
-    Replay --> Resolved[Move to resolved index]
-```
 
 The ingestion flow provides:
 
